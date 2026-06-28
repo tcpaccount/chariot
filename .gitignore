@@ -1,11 +1,24 @@
-# Generated PDFs
-export/*.pdf
+# Generated PDFs (rebuild with `make all`)
+export/
 
 # OS files
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # Editor files
 *.swp
 *.swo
 *~
+
+# VSCode (keep settings.json if you want shared config)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Claude Code local state
+.claude/settings.local.json
+
+# Windows artifacts
+ehthumbs.db
+ehthumbs_vista.db

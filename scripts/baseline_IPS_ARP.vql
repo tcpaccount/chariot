@@ -1,0 +1,95 @@
+-- REQUIRED HUNTS: 1) Windows.Network.ArpCache 2) Generic.Network.InterfaceAddresses
+LET known_IPS = (
+-- MANAGEMENT
+"10.0.20.11", "10.0.20.12", "10.0.20.13", "10.0.20.14", "10.0.20.15",
+-- LEGAL and FINANCE
+"10.0.20.21", "10.0.20.22", "10.0.20.23", "10.0.20.31", "10.0.20.32", "10.0.20.33",
+-- SALES and OPERATIONS
+"10.0.20.41", "10.0.20.42", "10.0.20.43", "10.0.20.71", "10.0.20.72"
+-- NETWORK SERVICES
+"10.0.20.51", "10.0.20.52", "10.0.20.53", "10.0.20.56", "10.0.20.57",
+-- PLANS and BUILDING SECURITY and CORPORATE DMZ
+"10.0.20.81", "10.0.20.82", "10.0.20.61", "10.0.20.62", "10.0.20.63", "10.0.40.10",
+-- DOMAIN SERVERS
+"10.0.0.10", "10.0.0.12", "10.0.0.14", "10.0.0.18", "10.0.0.20", "10.0.0.2", "10.0.0.199",
+-- APPLICATION SERVERS and SHIPPING & RECEIVING and CAFETERIA
+"10.0.10.10", "10.0.30.11", "10.0.30.12", "10.0.30.13", "10.0.30.31", "10.0.30.32", 
+-- HUMAN RESOURCES and BUIILDING MAINTENANCE
+"10.0.30.21", "10.0.30.22", "10.0.30.23", "10.0.30.41", "10.0.30.42", 
+-- SOFTWARE DEVELOPMENT and SKYNET
+"10.0.30.91", "10.0.30.92", "10.0.30.92", "10.0.30.71", "10.0.30.72", "10.0.30.73",
+-- DEFENSE LIAISON and FLIGHT OPERATIONS
+"10.0.30.61", "10.0.30.62", "10.0.30.63", "10.0.30.81", "10.0.30.82", "10.0.30.83",
+-- REMOTE CORP USERS and DRONES
+"155.67.0.41", "155.67.0.123", "155.67.0.207", "10.5.0.101", "10.5.0.102", "10.5.0.103",
+-- WIFI USERS and IRONDRONE 
+"10.100.0.101", "10.100.0.102", "10.100.0.103", "10.3.1.201", 
+-- ICS DMZ and LAB-1 ENGINEERS
+"10.3.1.10", "10.3.1.11", "10.3.1.12", "10.3.1.21", "10.3.1.41", "10.3.101.11", "10.3.101.12", 
+-- LAB-1 ICS and OPERATORS
+"10.3.101.201", "10.3.101.202", "10.3.101.221", "10.3.102.11", "10.3.102.12", "10.3.102.13", 
+-- PLANT and LAB-2 ENGINEERS 
+"10.3.102.201", "10.3.102.202", "10.3.102.221", "10.3.103.11", "10.3.103.12", 
+-- LAB-2 PLANT and CONTROL ROOM
+"10.3.103.201", "10.3.103.102", "10.3.103.221", "10.3.8.101", "10.3.8.102", "10.3.8.103"
+)
+
+let discovered_arp = SELECT * 
+FROM hunt_results(
+    artifact='Windows.Network.ArpCache',
+    hunt_id='H.D28HA3UI9P6OS')
+    
+let discovered_ips <= SELECT IP, Fqdn from hunt_results(
+    artifact='Generic.Network.InterfaceAddresses',
+    hunt_id='H.D28HA3UI9P6OS') 
+    WHERE IP =~ "10."
+
+
+/*
+    Endpoints not known prior at "10.0.0.0/8". Meaning VLR agent exists
+*/
+SELECT  Fqdn, IP  FROM discovered_ips
+WHERE IP =~ "10."
+AND not IP =~ ":"
+AND not IP =~ "169.254."
+AND not IP =~ "127.0.0.1"
+AND not IP in known_IPS
+GROUP BY Fqdn
+
+-- NEW APPROACH (POSSIBLE THANKS TO CONVERTION OF discovered_ips INTO STATIC LIST VIA "LET discovered_ips <=")
+SELECT * from foreach(
+row=known_IPS,
+query={SELECT _value as Missing_IP from scope() where not _value in discovered_ips.IP}
+)
+ 
+
+
+/*
+# Discovered unknown endpoints via ARP analysis
+*/
+select RemoteAddress, RemoteMACAddress, count() as count
+from discovered_arp
+WHERE AddressFamily = "IPv4"
+and RemoteAddress =~ "10."
+and not RemoteAddress =~ "\\.255"
+and not RemoteAddress =~ "\\.1"
+and NOT RemoteAddress in known_IPS
+GROUP BY RemoteAddress, RemoteMACAddress
+
+/*
+# Detailed break-down where discovery was made
+*/
+-- select Fqdn, count() as count, enumerate(items=RemoteAddress)
+-- from discovered_arp
+-- WHERE AddressFamily = "IPv4"
+-- and RemoteAddress =~ "10."
+-- and not RemoteAddress =~ "\\.255"
+-- and not RemoteAddress =~ "\\.1"
+-- and NOT RemoteAddress in excluded_ips
+-- GROUP BY Fqdn
+
+
+
+
+
+
