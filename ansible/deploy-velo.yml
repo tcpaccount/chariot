@@ -1,0 +1,5 @@
+- name: "Path D: Deploy Velociraptor Agent via Ansible"
+  hosts: windows
+  gather_facts: false
+  roles:
+    - deploy_velo

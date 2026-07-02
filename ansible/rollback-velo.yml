@@ -1,0 +1,13 @@
+- name: "Rollback: Remove Velociraptor Agent"
+  hosts: windows
+  gather_facts: false
+  tasks:
+    - name: Uninstall Velociraptor MSI
+      ansible.windows.win_package:
+        path: C:\Windows\Temp\velociraptor-client.msi
+        arguments: /qn
+        state: absent
+
+    - name: Ensure service is removed
+      ansible.windows.win_shell: sc.exe delete Velociraptor
+      ignore_errors: true

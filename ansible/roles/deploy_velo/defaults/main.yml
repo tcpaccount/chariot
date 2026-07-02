@@ -1,0 +1,3 @@
+msi_source: ./velociraptor-client-repacked.msi
+msi_remote_path: C:\Windows\Temp\velociraptor-client.msi
+velo_service_name: Velociraptor

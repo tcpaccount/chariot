@@ -199,3 +199,138 @@ GROUP BY RemoteAddress, RemoteMACAddress
 2. Adjust the IP prefix filter (`=~ "10."`) to match the client's network ranges
 3. Run the two prerequisite hunts and update the `hunt_id` values
 4. Run each query as a separate notebook cell in the Velociraptor frontend
+
+---
+
+## 3. Security Onion — osquery + ES|QL Baseline and Reconciliation
+
+When Velociraptor is not deployed but Security Onion is present with osquery enrolled endpoints, use this path instead. The same three-region Venn diagram logic applies — the data sources and query mechanism differ.
+
+### 3.1 Prerequisites
+
+- Security Onion with osquery fleet manager active and endpoints enrolled
+- Kibana accessible (SO web UI → Kibana)
+- Admin-provided asset list (IPs only, before any IT actions on the network)
+
+### 3.2 Collect Endpoint Data via Distributed Queries
+
+Run these from **SO Fleet Manager → Queries → New Distributed Query**, targeting all enrolled nodes.
+
+**Interface addresses** (replaces `Generic.Network.InterfaceAddresses`):
+
+```sql
+SELECT ia.address, ia.interface, id.mac, id.friendly_name, id.description
+FROM interface_addresses ia
+JOIN interface_details id ON ia.interface = id.interface
+WHERE ia.address LIKE '10.%'
+  AND ia.address NOT LIKE '169.254.%'
+  AND ia.address != '127.0.0.1';
+```
+
+**ARP cache** (replaces `Windows.Network.ArpCache`):
+
+```sql
+SELECT address, mac, interface
+FROM arp_cache
+WHERE address LIKE '10.%'
+  AND address NOT LIKE '%.255'
+  AND mac != '00:00:00:00:00:00';
+```
+
+Results flow automatically into Elasticsearch under the `osquery-results-*` index.
+
+### 3.3 Known Asset List
+
+The fixed IP list from the admin's network map. Used in ES|QL `IN`/`NOT IN` filters below — update this list before running any queries.
+
+```
+10.0.20.11, 10.0.20.12, 10.0.20.13   -- MANAGEMENT
+10.0.0.10, 10.0.0.12, 10.0.0.14      -- SERVERS
+10.0.20.21, 10.0.20.22, 10.0.20.23   -- WORKSTATIONS
+```
+
+### 3.4 Find Unknown Endpoints (Seen but Not in Asset List)
+
+Run in **Kibana → Discover → ES|QL** against `osquery-results-*`. Replace the `NOT IN` list with the IPs from section 3.3.
+
+```esql
+FROM osquery-results-*
+| WHERE host.ip LIKE "10.*"
+  AND host.ip NOT IN ("10.0.20.11", "10.0.20.12", "10.0.20.13",
+                      "10.0.0.10", "10.0.0.12", "10.0.0.14",
+                      "10.0.20.21", "10.0.20.22", "10.0.20.23")
+  AND host.ip NOT LIKE "169.254.*"
+  AND host.ip != "127.0.0.1"
+| STATS count = COUNT() BY host.ip, host.hostname
+| SORT host.ip ASC
+```
+
+### 3.5 Identify Present Endpoints (Infer Missing by Absence)
+
+This query returns known-list IPs that **did** check in. Any IP from section 3.3 absent from these results is a missing endpoint (offline, unreachable, or enrollment failed).
+
+```esql
+FROM osquery-results-*
+| WHERE host.ip IN ("10.0.20.11", "10.0.20.12", "10.0.20.13",
+                    "10.0.0.10", "10.0.0.12", "10.0.0.14",
+                    "10.0.20.21", "10.0.20.22", "10.0.20.23")
+| STATS last_seen = MAX(@timestamp) BY host.ip, host.hostname
+| SORT host.ip ASC
+```
+
+Manually compare this output against the full known list from section 3.3 to identify gaps.
+
+### 3.6 Discover ARP Unknowns (No Agent, Seen on Network)
+
+Devices that appeared in ARP caches reported by enrolled endpoints but are not in the known asset list and have no osquery enrollment. Highest-priority findings.
+
+```esql
+FROM osquery-results-*
+| WHERE osquery.name == "arp_cache"
+  AND osquery.columns.address LIKE "10.*"
+  AND osquery.columns.address NOT IN ("10.0.20.11", "10.0.20.12", "10.0.20.13",
+                                      "10.0.0.10", "10.0.0.12", "10.0.0.14",
+                                      "10.0.20.21", "10.0.20.22", "10.0.20.23")
+  AND osquery.columns.mac != "00:00:00:00:00:00"
+| STATS count = COUNT() BY osquery.columns.address, osquery.columns.mac
+| SORT count DESC
+```
+
+### 3.7 Interpretation Guide
+
+| Query | Result means | Action |
+|-------|-------------|--------|
+| 3.4 — Unknown endpoints | Device has osquery agent but wasn't in the admin's asset list | Investigate: legitimate undocumented device or unauthorized? |
+| 3.5 — Missing endpoints | Known asset not seen in osquery results | Check if offline, unreachable, or enrollment failed. Re-enroll or investigate. |
+| 3.6 — ARP unknowns | Device seen on wire, no agent, no asset record | Highest priority: potential rogue device, attacker infrastructure, or unmanaged IoT/OT. Investigate MAC vendor and network location. |
+
+### 3.8 ES|QL Limitation — Missing Endpoints
+
+ES|QL queries existing data and cannot emit rows for IPs with zero records. The missing-endpoint result (section 3.5) is inferred by comparing present IPs against the known list manually. For an explicit missing-IP list, use a Python diff against the Elasticsearch API:
+
+```python
+from elasticsearch import Elasticsearch
+
+known_ips = {
+    "10.0.20.11", "10.0.20.12", "10.0.20.13",
+    "10.0.0.10", "10.0.0.12", "10.0.0.14",
+    "10.0.20.21", "10.0.20.22", "10.0.20.23",
+}
+
+es = Elasticsearch("https://<so-node>:9200", ...)
+resp = es.search(index="osquery-results-*", aggs={
+    "ips": {"terms": {"field": "host.ip", "size": 5000}}
+}, size=0)
+
+seen_ips = {b["key"] for b in resp["aggregations"]["ips"]["buckets"]}
+
+print("Unknown (seen, not in admin list):", seen_ips - known_ips)
+print("Missing (in admin list, not seen):", known_ips - seen_ips)
+```
+
+### 3.9 Adapting for a New Engagement
+
+1. Replace the `IN`/`NOT IN` IP lists in sections 3.4–3.6 with the client's actual asset inventory
+2. Adjust the `LIKE "10.*"` prefix filters to match the client's network ranges
+3. Run the two distributed queries (3.2) and wait for results to arrive in Elasticsearch before running ES|QL
+4. Run each ES|QL query in a separate Kibana Discover tab for side-by-side comparison

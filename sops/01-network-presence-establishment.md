@@ -25,7 +25,7 @@ The team deploys a pre-built Proxmox server containing:
 | **Velociraptor** | Endpoint visibility, agent-based collection, VQL queries | 8000 (frontend), 8001 (client comms) |
 | **Security Onion** | Network traffic capture, SIEM, packet analysis | 3 tap input interfaces |
 | **DFIR-IRIS** | Case management, triage documentation, evidence tracking | 443 (web UI) |
-| **pfSense** | Port forwarding, routing, network segmentation for server | WAN/LAN as configured on-site |
+| **pfSense** | Routing and port forwarding between target network and IR tools | WAN (internet) / Mission (target network — port forwarding inbound) / LAN (IR tools + analyst access) |
 
 The server is pre-built and tested before deployment. Only site-specific configuration (IP addresses, agent configs) happens on-site.
 
@@ -104,16 +104,26 @@ Execute in order. Each step has a responsible role and a completion criteria.
 **Responsible:** Network Operator
 **Time estimate:** 15-30 minutes
 
-1. Access pfSense web UI from server console
-2. Configure WAN interface with site-assigned IP (or DHCP if available)
-3. Configure LAN interface for internal server network
-4. Add port forwarding rules:
-   - External → Velociraptor frontend (TCP 8000)
-   - External → Velociraptor client comms (TCP 8001)
-   - Any additional ports required for Security Onion agent forwarding
-5. Verify pfSense can reach the site network (ping gateway, DNS)
+pfSense has three interfaces with fixed purposes — only the Mission IP changes per site:
 
-**Complete when:** pfSense has connectivity to site network and port forwarding rules are active.
+| Interface | Connects to | Role |
+|-----------|-------------|------|
+| **WAN** | Internet | Upstream internet access (updates, threat intel) |
+| **Mission** | Target / client network | Inbound port forwarding for agent and sensor traffic from client endpoints |
+| **LAN** | IR tools + analyst switch | Velociraptor, Security Onion, DFIR-IRIS; analyst laptops plug into the physical switch on this segment |
+
+**Procedure:**
+
+1. Connect analyst laptop to the physical switch on the LAN segment; access pfSense web UI
+2. Configure **Mission** interface with a site-assigned IP on the client network (request fixed IP to assign)
+3. Confirm **LAN** interface is on the pre-configured IR tools subnet (static — should already be set)
+4. Confirm port forwarding rules on the **Mission** interface:
+   - Mission IP TCP 8001 → Velociraptor server (LAN) TCP 8001 — Velociraptor agent comms
+   - Mission IP TCP 8220 → Security Onion (LAN) TCP 8220 — SO Fleet Server (Elastic Agent ingestion)
+   - Mission IP TCP 5044 → Security Onion (LAN) TCP 5044 — Logstash / Beats ingestion (if used)
+5. Verify Mission interface can reach the client network (ping client gateway and DNS)
+
+**Complete when:** Mission interface has a client network IP, port forwarding rules are active, and client gateway is reachable.
 
 See: `playbooks/tool-deployment.md` Section 1 for exact commands.
 
@@ -121,40 +131,60 @@ See: `playbooks/tool-deployment.md` Section 1 for exact commands.
 **Responsible:** Network Operator
 **Time estimate:** 15-30 minutes
 
-1. From a laptop on the site network, verify:
-   - Can reach pfSense WAN IP
-   - Can reach Velociraptor frontend through pfSense (port 8000)
-   - Can reach DFIR-IRIS web UI
-2. If connectivity fails, troubleshoot:
-   - Check pfSense firewall rules and NAT
-   - Verify no site firewall blocking required ports
-   - Check cable connections and switch port status
+Two planes to verify — analyst access (LAN) and agent ingestion (Mission):
 
-**Complete when:** Velociraptor frontend and DFIR-IRIS are reachable from the site network.
+**LAN — analyst access (from analyst laptop on the LAN switch):**
+1. Verify Velociraptor frontend is reachable: `https://<velo-lan-ip>:8000`
+2. Verify DFIR-IRIS is reachable: `https://<iris-lan-ip>`
+3. Verify Security Onion web UI is reachable: `https://<so-lan-ip>`
+
+**Mission — agent ingestion (port forwarding validation):**
+4. From a machine on the client network, confirm the Mission IP is reachable (ping or TCP test to port 8001. If there are other target network different from the one our mission interface IP belongs to, probably default route must be estalished.)
+5. Deploy a test Velociraptor agent to one endpoint; confirm it checks in through the Mission IP
+
+If connectivity fails:
+- LAN tools unreachable → check LAN interface IP and switch cabling
+- Mission port forwarding fails → check pfSense NAT rules, confirm Mission IP is correct, verify no client-side firewall blocking the port
+
+**Complete when:** All three IR tools are reachable from the analyst switch, and at least one test agent checks in through the Mission interface.
 
 ### Step 4: Deploy Velociraptor Agents
 **Responsible:** Host Operator
 **Time estimate:** 30-90 minutes (depends on endpoint count and access method)
 
-**Decision tree — assess which path is available:**
+**Prerequisite — MSI repack (required before any deployment path):**
+
+The stock Velociraptor MSI must be repacked with a client config pointing at the pfSense **Mission** IP on port 8001 — this is the address target endpoints will connect to. Done once per engagement on the Velociraptor VM.
+See: `playbooks/tool-deployment.md` Section 1.1
+
+**Deployment paths — in priority order:**
 
 ```
-Do you have Domain Admin credentials?
-├── YES → Path A: AD/GPO deployment (faster, covers domain-joined machines)
-├── NO → Do you have local admin on target machines?
-│   ├── YES → Path B: PsExec/local deployment (machine-by-machine)
-│   └── NO → Escalate to Team Lead for credential acquisition strategy
+DEFAULT → Path A: WinRM/Invoke-Command (no extra tools required)
+          Requires: admin credentials + WinRM (TCP 5985) reachable on targets
+          See: playbooks/tool-deployment.md Section 1.2
+          See: scripts/deploy-velo-winrm.ps1
+
+PREFERRED FOR SCALE → Path D: Ansible (parallel, idempotent, pre-built VM on IR stack)
+          Requires: admin credentials + WinRM on targets + Ansible VM running
+          See: playbooks/tool-deployment.md Section 1.5
+          See: ansible/deploy-velo.yml
+
+FALLBACK → Path B: PsExec/local (if WinRM unavailable, SMB is open)
+          Requires: admin credentials + SMB (TCP 445) + admin share (C$) on targets
+          See: playbooks/tool-deployment.md Section 1.3
+          See: scripts/deploy-velo-local.ps1
+
+FALLBACK → Path C: AD/GPO (if domain admin available and WinRM/SMB blocked at scale)
+          Requires: Domain Admin credentials + DC access + SMB on targets
+          See: playbooks/tool-deployment.md Section 1.4
+          See: scripts/deploy-velo-ad.ps1
+
+LAST RESORT → USB manual install (isolated hosts with no network access)
+          See: playbooks/tool-deployment.md Section 1.3, Step 3
 ```
 
-**Path A: AD/GPO deployment**
-See: `playbooks/tool-deployment.md` Section 2, Path A
-See: `scripts/deploy-velo-ad.ps1`
-
-**Path B: Local/PsExec deployment**
-See: `playbooks/tool-deployment.md` Section 2, Path B
-See: `scripts/deploy-velo-local.ps1`
-
-**Complete when:** Agents are deployed and checking in. Verify from Velociraptor console.
+**Complete when:** Agents are deployed and checking in. Verify from Velociraptor console (see Step 5).
 
 ### Step 5: Verify Agent Check-in
 **Responsible:** Host Operator
@@ -319,10 +349,12 @@ The network presence is **established** when ALL five conditions are confirmed:
 
 ## Appendix B: Quick Reference — Key Ports
 
-| Service | Port | Protocol | Direction |
-|---------|------|----------|-----------|
-| Velociraptor Frontend | 8000 | TCP | Analyst → Server |
-| Velociraptor Client Comms | 8001 | TCP | Endpoints → Server |
-| DFIR-IRIS Web UI | 443 | TCP | Analyst → Server |
-| Security Onion Web UI | 443 | TCP | Analyst → Server |
-| pfSense Web UI | 8443 | TCP | Analyst → Server (mgmt only) |
+| Service | Port | Protocol | Interface | Direction |
+|---------|------|----------|-----------|-----------|
+| Velociraptor Frontend | 8000 | TCP | LAN | Analyst laptop → Velociraptor |
+| Velociraptor Agent Comms | 8001 | TCP | Mission (forwarded → LAN) | Target endpoints → Velociraptor |
+| DFIR-IRIS Web UI | 443 | TCP | LAN | Analyst laptop → DFIR-IRIS |
+| Security Onion Web UI | 443 | TCP | LAN | Analyst laptop → Security Onion |
+| SO Fleet Server (Elastic Agent) | 8220 | TCP | Mission (forwarded → LAN) | Target endpoints → Security Onion |
+| SO Logstash / Beats | 5044 | TCP | Mission (forwarded → LAN) | Target endpoints → Security Onion |
+| pfSense Web UI | 8443 | TCP | LAN | Analyst laptop → pfSense (mgmt only) |

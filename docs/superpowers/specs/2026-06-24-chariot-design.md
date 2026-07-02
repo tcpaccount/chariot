@@ -135,23 +135,36 @@ Companion reference document with actual commands, queries, and step-by-step pro
 
 ### 4.2 Velociraptor Agent Deployment — Decision Tree
 
-Two paths based on available access level:
+Four paths based on available access level and tooling:
 
-**Path A: Domain Admin available (AD/GPO)**
+**Path A: WinRM/Invoke-Command**
 
-- `velociraptor config repack` to generate site-specific client config with correct server URL and certs
+- Native PowerShell Remoting, no GPO or PsExec required
+- Deploys via `Invoke-Command` over WinRM (TCP 5985/5986)
+- Rollback procedure
+
+**Path B: Local/PsExec**
+
+- PsExec-based remote deployment script (accepts IP list as input)
+- Manual USB-based deployment for isolated/unreachable hosts
+- Per-host check-in verification
+- Rollback procedure
+
+**Path C: AD/GPO**
+
 - PowerShell commands to create GPO, link to target OU, assign MSI package
 - `gpupdate /force` and verification steps
 - VQL queries to verify agent check-in from Velociraptor console
 - Rollback procedure (GPO removal, agent uninstall)
 
-**Path B: Local admin only (no AD)**
+**Path D: Ansible (from dedicated Ansible VM on Proxmox stack)**
 
-- `velociraptor config repack` for site-specific client config
-- PsExec-based remote deployment script (accepts IP list as input)
-- Manual USB-based deployment for isolated/unreachable hosts
-- Per-host check-in verification
-- Rollback procedure
+- Pre-configured Ubuntu VM on the IR server with Ansible, pywinrm, and playbooks pre-staged
+- Uses WinRM transport (same as Path A) but wrapped in idempotent Ansible roles
+- Parallel deployment across all targets from a single command
+- On-site workflow: edit inventory with target IPs, run `ansible-playbook`
+- Extensible to SO agent and baselining via additional roles
+- Rollback via dedicated playbook
 
 **Agent config:** What changes per site (server URL, certs) vs what stays standard (collection config, labels).
 

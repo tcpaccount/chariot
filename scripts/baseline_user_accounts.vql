@@ -1,0 +1,62 @@
+-- STEP 1 REQUIRED HUNTS (replace hunt_id in both LET blocks below):
+--   1) Exchange.Windows.EventLogs.LogonSessions
+--   2) Windows.Sys.Interfaces
+--
+-- STEP 2 REQUIRED HUNT (replace hunt_id in the SELECT below):
+--   3) Windows.EventLogs.RDPAuth  (parameter: UserNameRegex = .(User1|User2).)
+--      NOTE: Despite its name, RDPAuth covers ALL authentication types, not only RDP.
+--      Alternative: Windows.Packs.LateralMovement (broader — includes PTH, PTT, token impersonation)
+
+
+/*
+    STEP 1 — Baseline interactive logons (EventID 4624, LogonType 2)
+    Run this first. Output is the normal user->machine map ordered by frequency.
+    High count = established pattern. Low-count rows are early anomalies.
+*/
+
+LET the_logons = SELECT Fqdn, TargetUserName[0] AS TargetUserName, SourceHost,
+                        LogonType[0] AS LogonType, count() AS count
+FROM hunt_results(
+    artifact='Exchange.Windows.EventLogs.LogonSessions',
+    hunt_id='H.REPLACE_ME')
+WHERE LogonType = 2
+GROUP BY Fqdn, TargetUserName, SourceHost, LogonType
+
+LET the_interfaces = SELECT Fqdn, Details.IP AS IP
+FROM hunt_results(
+    artifact='Windows.Sys.Interfaces',
+    hunt_id='H.REPLACE_ME')
+WHERE Details.IP =~ "10\\."
+
+SELECT * FROM foreach(
+    row={ SELECT *, Fqdn AS Fqdn_IP FROM the_logons },
+    query={
+        SELECT Fqdn, IP, TargetUserName, SourceHost, LogonType, count
+        FROM the_interfaces
+        WHERE Fqdn = Fqdn_IP
+    }
+)
+ORDER BY count DESC
+
+
+/*
+    STEP 2 — Detect lateral movement
+    Use Step 1 output to build the WHERE filters below:
+      - Each (UserName =~ "x" AND NOT Computer =~ "y") block = flag user X on any machine except their known home Y
+      - Update server exclusions (dc / exchange / fs1) to match client infrastructure naming
+*/
+
+SELECT EventTime, Computer, Channel, EventID, UserName, LogonType,
+       SourceIP, Description, Message, Fqdn
+FROM hunt_results(
+    artifact='Windows.EventLogs.RDPAuth',
+    hunt_id='H.REPLACE_ME')
+WHERE (
+    (UserName =~ "romio"         AND NOT Computer =~ "DESKTOP-GJB37HJ")
+    OR
+    (UserName =~ "Administrator" AND NOT Computer =~ "WIN-R42UU0TEM40")
+    -- Add one OR block per user from Step 1 baseline
+)
+AND NOT EventID = 4634
+AND NOT (Computer =~ "dc" OR Computer =~ "exchange" OR Computer =~ "fs1")
+ORDER BY EventTime

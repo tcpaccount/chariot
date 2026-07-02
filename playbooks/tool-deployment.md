@@ -381,7 +381,197 @@ Remove-GPO -Name "Deploy Velociraptor Agent"
 msiexec /x velociraptor-client-repacked.msi /qn
 ```
 
-### 1.5 Agent Config Reference
+### 1.5 Path D: Ansible Deployment
+
+**Prerequisites:**
+
+- A dedicated Ansible control VM (Ubuntu) on the Proxmox IR server stack, pre-configured before deployment
+- Ansible installed with the Windows modules collection and WinRM Python library
+- WinRM enabled on target machines (same requirement as Path A)
+- Admin credentials on target machines
+- IP list of targets
+- Repacked MSI (from section 1.1)
+
+This path uses the same WinRM transport as Path A but wraps it in Ansible playbooks — giving you idempotent, parallel, repeatable deployments from a single command. The Ansible VM is pre-built as part of the IR server stack so all tooling is ready before arrival on-site.
+
+| Feature | Path A (WinRM script) | Path D (Ansible) |
+|---------|----------------------|------------------|
+| Idempotent | No — re-running reinstalls | Yes — skips if already installed |
+| Parallel | Manual with `-Parallel` | Built-in (default 5 forks) |
+| Error handling | Custom per-script | Built-in with retry/ignore |
+| Reporting | Manual `Write-Host` | Structured recap at end |
+| Rollback | Separate script | `ansible-playbook rollback-velo.yml` |
+| Extends to SO agent | New script | Add another role |
+
+#### 1.5.1 Ansible VM Setup (One-Time, Pre-Deployment)
+
+Build an Ubuntu VM on the Proxmox host alongside Velociraptor, Security Onion, and DFIR-IRIS. This VM is prepared ahead of time — not on-site.
+
+**Step 1: Install Ansible and dependencies**
+
+```bash
+sudo apt update && sudo apt install -y ansible python3-pip  # On newer distros, use pipx instead of pip
+pipx install pywinrm  # Or: pip install pywinrm (if pip is available)
+ansible-galaxy collection install ansible.windows
+```
+
+Verify installation:
+
+```bash
+ansible --version
+```
+
+**Step 2: Clone the chariot repo (or copy the ansible/ directory)**
+
+The `ansible/` directory in the chariot project contains all playbooks, roles, and configuration files ready to use:
+
+```
+ansible/
+├── inventory/
+│   └── hosts.yml          # target machines — edit on-site
+├── group_vars/
+│   └── windows.yml        # WinRM connection settings (pre-configured)
+├── roles/
+│   └── deploy_velo/
+│       ├── tasks/
+│       │   └── main.yml   # deployment steps
+│       └── defaults/
+│           └── main.yml   # default variables
+├── deploy-velo.yml        # main playbook
+└── rollback-velo.yml      # rollback playbook
+```
+
+**Step 3: Place the repacked MSI**
+
+Copy `velociraptor-client-repacked.msi` (from section 1.1) into the `ansible/` directory so the playbook can find it:
+
+```bash
+cp /path/to/velociraptor-client-repacked.msi ~/chariot/ansible/
+```
+
+#### 1.5.2 WinRM Prerequisite on Targets
+
+Same as Path A. WinRM must be enabled on each target machine:
+
+```powershell
+# Run locally on each target (elevated)
+Enable-PSRemoting -Force
+```
+
+For non-domain-joined targets, also add them to TrustedHosts on the Ansible VM (not needed — Ansible handles this via `ansible_winrm_server_cert_validation: ignore` in `group_vars/windows.yml`).
+
+**Test connectivity from the Ansible VM:**
+
+```bash
+ansible -m ansible.windows.win_ping \
+  -i "192.168.1.10," \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass \
+  -e "ansible_connection=winrm ansible_winrm_transport=ntlm ansible_winrm_port=5985 ansible_winrm_scheme=http ansible_winrm_server_cert_validation=ignore" \
+  all
+```
+
+The `-e` flags are required here because inline inventory (`-i "IP,"`) doesn't load `group_vars/windows.yml` — the host isn't in the `windows` group. Without them, Ansible defaults to SSH and fails.
+
+If you get `SUCCESS`, Ansible can reach the target. If it fails, verify WinRM is running on the target (`Test-WSMan -ComputerName <IP>` from a Windows machine) and that TCP 5985 is not blocked by the firewall.
+
+#### 1.5.3 On-Site Deployment Steps
+
+**Step 1: Edit the inventory with discovered target IPs**
+
+Edit `ansible/inventory/hosts.yml` and add one IP per line:
+
+```yaml
+all:
+  children:
+    windows:
+      hosts:
+        192.168.1.10:
+        192.168.1.11:
+        192.168.1.12:
+```
+
+**Step 2: Deploy Velociraptor agent to all targets**
+
+```bash
+cd ~/chariot/ansible
+ansible-playbook deploy-velo.yml \
+  -i inventory/hosts.yml \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass
+```
+
+This will, for each target in parallel:
+
+1. Copy the repacked MSI to `C:\Windows\Temp\`
+2. Install silently via `msiexec /qn /norestart`
+3. Ensure the Velociraptor service is running and set to auto-start
+4. Report the service status
+
+**Deploy to specific hosts without editing inventory:**
+
+```bash
+ansible-playbook deploy-velo.yml \
+  -i "192.168.1.10,192.168.1.11," \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass
+```
+
+Note the trailing comma — Ansible requires it for inline host lists.
+
+**Limit to a single host (for testing):**
+
+```bash
+ansible-playbook deploy-velo.yml \
+  -i inventory/hosts.yml \
+  --limit 192.168.1.10 \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass
+```
+
+**Step 3: Verify deployment**
+
+From the Velociraptor frontend — same VQL query as all other paths:
+
+```
+SELECT client_id, os_info.hostname, os_info.system, last_seen_at
+FROM clients()
+WHERE last_seen_at > now() - 600
+ORDER BY os_info.hostname
+```
+
+#### 1.5.4 Rollback
+
+```bash
+ansible-playbook rollback-velo.yml \
+  -i inventory/hosts.yml \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass
+```
+
+This will uninstall the MSI and remove the Velociraptor service from all targets.
+
+To rollback a single host:
+
+```bash
+ansible-playbook rollback-velo.yml \
+  -i inventory/hosts.yml \
+  --limit 192.168.1.10 \
+  -u 'DOMAIN\AdminUser' \
+  --ask-pass
+```
+
+#### 1.5.5 Extending to Other Deployments
+
+The same Ansible VM and structure can deploy the SO Elastic Agent by adding a second role:
+
+```bash
+mkdir -p ansible/roles/deploy_so_agent/{tasks,defaults}
+```
+
+Then create a `deploy-so-agent.yml` playbook that follows the same pattern. One VM, one inventory, multiple playbooks — all pre-staged before arrival.
+
+### 1.6 Agent Config Reference
 
 **Changes per site (must be updated):**
 - `server_url` — pfSense WAN IP and Velociraptor client comms port
@@ -394,140 +584,16 @@ msiexec /x velociraptor-client-repacked.msi /qn
 
 ---
 
-## 2. Security Onion — Traffic Ingestion Verification
+## 2. Security Onion — Agent Deployment & Traffic Verification
 
-### 2.1 Verify Tap Interfaces Are Receiving Traffic
-
-```bash
-# SSH into Security Onion VM
-ssh user@<security-onion-VM-IP>
-
-# Check each tap interface for packet counts
-sudo tcpdump -i <tap-interface-1> -c 10 -q
-sudo tcpdump -i <tap-interface-2> -c 10 -q
-sudo tcpdump -i <tap-interface-3> -c 10 -q
-```
-
-Each command should show packets being captured. If no packets appear, check physical tap connections and pfSense interface assignments.
-
-### 2.2 Verify Parsing and Normalization
-
-```bash
-# Check Zeek (network metadata) is processing
-sudo so-zeek-status
-
-# Check Suricata (IDS alerts) is running
-sudo so-suricata-status
-
-# Check recent Zeek logs
-ls -lt /nsm/zeek/logs/current/
-```
-
-### 2.3 Verify Logs in SIEM View
-
-1. Open Security Onion web UI: `https://<security-onion-VM-IP>`
-2. Navigate to Hunt or Dashboards
-3. Set time range to "Last 15 minutes"
-4. Confirm events are appearing (DNS queries, HTTP connections, etc.)
-
-If no events appear but tcpdump shows traffic, check:
-
-```bash
-# Elasticsearch status
-sudo so-elasticsearch-status
-
-# Logstash pipeline
-sudo so-logstash-status
-```
-
-### 2.4 Fix: Fleet Agent Certificate Failure Behind pfSense/NAT
-
-When Security Onion sits behind pfSense with port forwarding, Elastic Fleet agents fail to register with a certificate validation error. The Fleet server certificate's SANs don't include the pfSense WAN IP that agents connect through.
-
-**Root cause:** The Fleet certificate is generated by Salt in `/opt/so/saltstack/default/salt/elasticfleet/ssl.sls`. The SAN line builds entries from the SO hostname, URL base, and node IP — but not the external pfSense IP. When `custom_fqdn` is set, it's added with a `DNS:` prefix, which fails validation if the value is an IP address (IPs require `IP:` prefix).
-
-The original SAN line in `ssl.sls`:
-
-```jinja
-- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %},DNS:{{ ELASTICFLEETMERGED.config.server.custom_fqdn | join(',DNS:') }}{% endif %}
-```
-
-**Fix — Step 1: Set the pfSense WAN IP as custom_fqdn**
-
-```bash
-sudo so-elasticfleet-config-set server.custom_fqdn <pfsense-WAN-IP>
-```
-
-**Fix — Step 2: Copy the default ssl.sls to local override**
-
-```bash
-sudo cp /opt/so/saltstack/default/salt/elasticfleet/ssl.sls \
-        /opt/so/saltstack/local/salt/elasticfleet/ssl.sls
-```
-
-**Fix — Step 3: Edit the local copy to use `IP:` prefix for IP-based custom FQDNs**
-
-```bash
-sudo vim /opt/so/saltstack/local/salt/elasticfleet/ssl.sls
-```
-
-Change the SAN line to handle IPs correctly (from github):
-
-```jinja
-- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %}{% for fqdn in ELASTICFLEETMERGED.config.server.custom_fqdn %}{% if fqdn | is_ip %},IP:{{ fqdn }}{% else %},DNS:{{ fqdn }}{% endif %}{% endfor %}{% endif %}
-```
-
-Change the SAN line to handle IPs correctly (my fix that worked in the past. DNS changed to IP). Find 2 placed to change in the file:
-```jinja
-- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %},DNS:{{ ELASTICFLEETMERGED.config.server.custom_fqdn | join(',IP:') }}{% endif %}
-```
-
-**Fix — Step 4: Apply changes and regenerate certificates**
-
-```bash
-sudo salt-call state.highstate
-```
-
-Verify the new certificate includes the pfSense IP:
-
-```bash
-openssl x509 -in /etc/pki/elasticfleet-server.crt -noout -text | grep -A1 "Subject Alternative Name"
-```
-
-The output should show `IP Address:<pfsense-WAN-IP>` in the SAN list.
-
-**Fix — Step 5: Re-download and redeploy Fleet agent installers**
-
-After certificate regeneration, existing agent installers are stale. Download fresh ones:
-
-```bash
-sudo so-elastic-agent-get-installers
-```
-
-Then redeploy to endpoints.
-
-### 2.5 SO Elastic Agent Deployment
-
-Both paths below produce a **full SO agent** — same binary, same integrations (Elastic Defend, osquery, endpoint telemetry), same indices and views in SO. The enrollment token determines which Fleet policy the agent receives, not how it was installed. As long as the token maps to SO's agent policy, the agent is fully functional.
+### 2.1 SO Elastic Agent Deployment
 
 **Prerequisites (both paths):** Admin credentials on target machines, WinRM enabled on targets, IP list of targets (same as Velociraptor Path A).
 
-**Prepare on the SO manager before deployment:**
 
-```bash
-# Generate bundled installers (Path A)
-sudo so-elastic-agent-get-installers
-# Installers are written to /nsm/elastic-agent/
+### 2.1.1 Path A: SO Bundled Installer via WinRM
 
-# Retrieve enrollment token (Path B)
-sudo so-elastic-agent-get-token
-```
-
-The Fleet URL is `https://<pfsense-WAN-IP>:8220` (or `https://<SO-IP>:8220` if agents connect directly to SO without NAT).
-
-### 2.5.1 Path A: SO Bundled Installer via WinRM
-
-Security Onion generates self-contained MSI installers with the Fleet URL and enrollment token already baked in — no flags needed on the endpoint. This path requires the Fleet certificate to be valid (if behind NAT, apply section 2.4 first).
+Security Onion generates self-contained MSI installers with the Fleet URL and enrollment token already baked in — no flags needed on the endpoint. This path requires the Fleet certificate to be valid (if behind NAT, apply section 2.5 first).
 
 **Step 1: Prepare target list**
 
@@ -587,7 +653,7 @@ foreach ($Target in $Targets) {
 
 Check the SO Fleet UI: **SO Web UI → Fleet → Agents** — deployed agents should appear as "Healthy."
 
-**Note:** If agents fail to enroll due to certificate errors (common behind pfSense/NAT), fix the certificate first (section 2.4). The SO bundled installer does not support `--insecure` — use Path B instead as a workaround.
+**Note:** If agents fail to enroll due to certificate errors (common behind pfSense/NAT), fix the certificate first (section 2.5). The SO bundled installer does not support `--insecure` — use Path B instead as a workaround.
 
 **Rollback:**
 
@@ -601,9 +667,9 @@ Invoke-Command -Session $Session -ScriptBlock {
 Remove-PSSession $Session
 ```
 
-### 2.5.2 Path B: Raw Elastic Agent with --insecure via WinRM
+### 2.1.2 Path B: Raw Elastic Agent with --insecure via WinRM
 
-Uses the standard `elastic-agent install` command directly, bypassing SO's bundled installer. This allows the `--insecure` flag to skip certificate validation — useful when SO is behind pfSense/NAT and the certificate fix (section 2.4) hasn't been applied yet.
+Uses the standard `elastic-agent install` command directly, bypassing SO's bundled installer. This allows the `--insecure` flag to skip certificate validation — useful when SO is behind pfSense/NAT and the certificate fix (section 2.5) hasn't been applied yet.
 
 **Prerequisites (in addition to WinRM):**
 
@@ -672,7 +738,7 @@ The `--insecure` flag skips all certificate chain verification. The `--non-inter
 
 Check the SO Fleet UI: **SO Web UI → Fleet → Agents** — agents should appear as "Healthy" with full policy applied.
 
-**Important:** The agent is fully functional — same policy, same data collection, same indices as Path A. The only difference is the transport is not certificate-verified. Suitable for IR engagements where speed matters and the network is trusted. For long-term deployments, apply the certificate fix (section 2.4) and redeploy via Path A.
+**Important:** The agent is fully functional — same policy, same data collection, same indices as Path A. The only difference is the transport is not certificate-verified. Suitable for IR engagements where speed matters and the network is trusted. For long-term deployments, apply the certificate fix (section 2.5) and redeploy via Path A.
 
 **Rollback:**
 
@@ -683,6 +749,118 @@ Invoke-Command -Session $Session -ScriptBlock {
 }
 Remove-PSSession $Session
 ```
+
+### 2.2 Verify Tap Interfaces Are Receiving Traffic
+
+```bash
+# SSH into Security Onion VM
+ssh user@<security-onion-VM-IP>
+
+# Check each tap interface for packet counts
+sudo tcpdump -i <tap-interface-1> -c 10 -q
+sudo tcpdump -i <tap-interface-2> -c 10 -q
+sudo tcpdump -i <tap-interface-3> -c 10 -q
+```
+
+Each command should show packets being captured. If no packets appear, check physical tap connections and pfSense interface assignments.
+
+### 2.3 Verify Parsing and Normalization
+
+```bash
+# general SO service health check
+sudo so-status
+# Check Zeek (network metadata) is processing
+sudo so-zeek-status
+
+# Check Suricata (IDS alerts) is running
+sudo so-suricata-status
+
+# Check recent Zeek logs
+ls -lt /nsm/zeek/logs/current/
+```
+
+### 2.4 Verify Logs in SIEM View
+
+1. Open Security Onion web UI: `https://<security-onion-VM-IP>`
+2. Navigate to Hunt or Dashboards
+3. Set time range to "Last 15 minutes"
+4. Confirm events are appearing (DNS queries, HTTP connections, etc.)
+
+If no events appear but tcpdump shows traffic, check:
+
+```bash
+# Elasticsearch status
+sudo so-elasticsearch-status
+
+# Logstash pipeline
+sudo so-logstash-status
+```
+
+### 2.5 Fix: Fleet Agent Certificate Failure Behind pfSense/NAT
+
+When Security Onion sits behind pfSense with port forwarding, Elastic Fleet agents fail to register with a certificate validation error. The Fleet server certificate's SANs don't include the pfSense WAN IP that agents connect through.
+
+**Root cause:** The Fleet certificate is generated by Salt in `/opt/so/saltstack/default/salt/elasticfleet/ssl.sls`. The SAN line builds entries from the SO hostname, URL base, and node IP — but not the external pfSense IP. When `custom_fqdn` is set, it's added with a `DNS:` prefix, which fails validation if the value is an IP address (IPs require `IP:` prefix).
+
+The original SAN line in `ssl.sls`:
+
+```jinja
+- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %},DNS:{{ ELASTICFLEETMERGED.config.server.custom_fqdn | join(',DNS:') }}{% endif %}
+```
+
+**Fix — Step 1: Set the pfSense WAN IP as custom_fqdn**
+
+```bash
+sudo so-elasticfleet-config-set server.custom_fqdn <pfsense-WAN-IP>
+```
+
+**Fix — Step 2: Copy the default ssl.sls to local override**
+
+```bash
+sudo cp /opt/so/saltstack/default/salt/elasticfleet/ssl.sls \
+        /opt/so/saltstack/local/salt/elasticfleet/ssl.sls
+```
+
+**Fix — Step 3: Edit the local copy to use `IP:` prefix for IP-based custom FQDNs**
+
+```bash
+sudo vim /opt/so/saltstack/local/salt/elasticfleet/ssl.sls
+```
+
+Change the SAN line to handle IPs correctly (from github):
+
+```jinja
+- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %}{% for fqdn in ELASTICFLEETMERGED.config.server.custom_fqdn %}{% if fqdn | is_ip %},IP:{{ fqdn }}{% else %},DNS:{{ fqdn }}{% endif %}{% endfor %}{% endif %}
+```
+
+Change the SAN line to handle IPs correctly (my fix that worked in the past. DNS changed to IP). Find 2 placed to change in the file:
+```jinja
+- subjectAltName: DNS:{{ GLOBALS.hostname }},DNS:{{ GLOBALS.url_base }},IP:{{ GLOBALS.node_ip }}{% if ELASTICFLEETMERGED.config.server.custom_fqdn | length > 0 %},DNS:{{ ELASTICFLEETMERGED.config.server.custom_fqdn | join(',IP:') }}{% endif %}
+```
+
+**Fix — Step 4: Apply changes and regenerate certificates**
+
+```bash
+sudo salt-call state.highstate
+```
+
+Verify the new certificate includes the pfSense IP:
+
+```bash
+openssl x509 -in /etc/pki/elasticfleet-server.crt -noout -text | grep -A1 "Subject Alternative Name"
+```
+
+The output should show `IP Address:<pfsense-WAN-IP>` in the SAN list.
+
+**Fix — Step 5: Re-download and redeploy Fleet agent installers**
+
+After certificate regeneration, existing agent installers are stale. Download fresh ones:
+
+```bash
+sudo so-elastic-agent-get-installers
+```
+
+Then redeploy to endpoints.
 
 ---
 

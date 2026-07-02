@@ -1,7 +1,14 @@
 PANDOC := pandoc
 IMG_DIR := playbooks/images
 
-PANDOC_FLAGS := --from markdown --to pdf --pdf-engine=xelatex \
+# --- Output format (default: pdf) ---
+# Usage:  make all              → PDF (default)
+#         make all FMT=docx     → DOCX
+#         make all FMT=pptx     → PPTX
+#         make playbooks FMT=docx
+FMT ?= pdf
+
+PANDOC_PDF_FLAGS := --from markdown --to pdf --pdf-engine=xelatex \
     -V geometry:margin=1in \
     -V geometry:headheight=52pt \
     -V fontsize=11pt \
@@ -11,55 +18,72 @@ PANDOC_FLAGS := --from markdown --to pdf --pdf-engine=xelatex \
     -V urlcolor=blue \
     -V header-includes='\usepackage{fancyhdr}\usepackage{graphicx}\pagestyle{fancy}\fancyhead[L]{\includegraphics[height=42pt]{$(IMG_DIR)/top_left.png}}\fancyhead[C]{CHARIOT — DFIR IR Framework}\fancyhead[R]{\includegraphics[height=42pt]{$(IMG_DIR)/top_right.png}}\fancyfoot[C]{\thepage}'
 
+PANDOC_DOCX_FLAGS := --from markdown --to docx \
+    --reference-doc=$(IMG_DIR)/reference.docx
+
+PANDOC_PPTX_FLAGS := --from markdown --to pptx \
+    --slide-level=2
+
+ifeq ($(FMT),docx)
+  PANDOC_FLAGS := $(PANDOC_DOCX_FLAGS)
+  EXT := docx
+else ifeq ($(FMT),pptx)
+  PANDOC_FLAGS := $(PANDOC_PPTX_FLAGS)
+  EXT := pptx
+else
+  PANDOC_FLAGS := $(PANDOC_PDF_FLAGS)
+  EXT := pdf
+endif
+
 EXPORT_DIR := export
 
 SOP_SRCS := $(wildcard sops/*.md)
-SOP_PDFS := $(patsubst sops/%.md,$(EXPORT_DIR)/sops-%.pdf,$(SOP_SRCS))
+SOP_OUTS := $(patsubst sops/%.md,$(EXPORT_DIR)/sops-%.$(EXT),$(SOP_SRCS))
 
 PLAYBOOK_SRCS := $(wildcard playbooks/*.md)
-PLAYBOOK_PDFS := $(patsubst playbooks/%.md,$(EXPORT_DIR)/playbooks-%.pdf,$(PLAYBOOK_SRCS))
+PLAYBOOK_OUTS := $(patsubst playbooks/%.md,$(EXPORT_DIR)/playbooks-%.$(EXT),$(PLAYBOOK_SRCS))
 
 TEMPLATE_SRCS := $(wildcard templates/*.md)
-TEMPLATE_PDFS := $(patsubst templates/%.md,$(EXPORT_DIR)/templates-%.pdf,$(TEMPLATE_SRCS))
+TEMPLATE_OUTS := $(patsubst templates/%.md,$(EXPORT_DIR)/templates-%.$(EXT),$(TEMPLATE_SRCS))
 
 DOC_SRCS := $(wildcard docs/superpowers/specs/*.md) $(wildcard docs/superpowers/plans/*.md)
-DOC_PDFS := $(patsubst docs/%.md,$(EXPORT_DIR)/docs-%.pdf,$(DOC_SRCS))
+DOC_OUTS := $(patsubst docs/%.md,$(EXPORT_DIR)/docs-%.$(EXT),$(DOC_SRCS))
 
 ROOT_SRCS := README.md
-ROOT_PDFS := $(patsubst %.md,$(EXPORT_DIR)/%.pdf,$(ROOT_SRCS))
+ROOT_OUTS := $(patsubst %.md,$(EXPORT_DIR)/%.$(EXT),$(ROOT_SRCS))
 
-.PHONY: all sops playbooks templates docs clean
+.PHONY: all sops playbooks templates docs root clean
 
 all: sops playbooks templates docs root
 
-sops: $(SOP_PDFS)
+sops: $(SOP_OUTS)
 
-playbooks: $(PLAYBOOK_PDFS)
+playbooks: $(PLAYBOOK_OUTS)
 
-templates: $(TEMPLATE_PDFS)
+templates: $(TEMPLATE_OUTS)
 
-docs: $(DOC_PDFS)
+docs: $(DOC_OUTS)
 
-root: $(ROOT_PDFS)
+root: $(ROOT_OUTS)
 
-$(EXPORT_DIR)/sops-%.pdf: sops/%.md | $(EXPORT_DIR)
+$(EXPORT_DIR)/sops-%.$(EXT): sops/%.md | $(EXPORT_DIR)
 	$(PANDOC) $(PANDOC_FLAGS) -o $@ $<
 
-$(EXPORT_DIR)/playbooks-%.pdf: playbooks/%.md | $(EXPORT_DIR)
+$(EXPORT_DIR)/playbooks-%.$(EXT): playbooks/%.md | $(EXPORT_DIR)
 	$(PANDOC) $(PANDOC_FLAGS) -o $@ $<
 
-$(EXPORT_DIR)/templates-%.pdf: templates/%.md | $(EXPORT_DIR)
+$(EXPORT_DIR)/templates-%.$(EXT): templates/%.md | $(EXPORT_DIR)
 	$(PANDOC) $(PANDOC_FLAGS) -o $@ $<
 
-$(EXPORT_DIR)/docs-%.pdf: docs/%.md | $(EXPORT_DIR)
+$(EXPORT_DIR)/docs-%.$(EXT): docs/%.md | $(EXPORT_DIR)
 	@mkdir -p $(dir $@)
 	$(PANDOC) $(PANDOC_FLAGS) -o $@ $<
 
-$(EXPORT_DIR)/%.pdf: %.md | $(EXPORT_DIR)
+$(EXPORT_DIR)/%.$(EXT): %.md | $(EXPORT_DIR)
 	$(PANDOC) $(PANDOC_FLAGS) -o $@ $<
 
 $(EXPORT_DIR):
 	mkdir -p $(EXPORT_DIR)
 
 clean:
-	rm -rf $(EXPORT_DIR)/*.pdf $(EXPORT_DIR)/docs-superpowers
+	rm -rf $(EXPORT_DIR)/*.pdf $(EXPORT_DIR)/*.docx $(EXPORT_DIR)/*.pptx $(EXPORT_DIR)/docs-superpowers

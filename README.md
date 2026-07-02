@@ -13,6 +13,7 @@ sops/           — Standard Operating Procedures (numbered)
 playbooks/      — Technical reference guides with commands and queries
 templates/      — Fillable deliverable templates for field use
 scripts/        — PowerShell deployment and baselining scripts
+ansible/        — Ansible playbooks and roles for Path D deployment
 export/         — Generated PDFs (gitignored)
 ```
 
@@ -38,6 +39,16 @@ export/         — Generated PDFs (gitignored)
 | `scripts/deploy-velo-ad.ps1` | Deploy Velociraptor agents via Active Directory GPO |
 | `scripts/deploy-velo-local.ps1` | Deploy Velociraptor agents via PsExec (no AD) |
 | `scripts/baseline-endpoints.ps1` | Baseline endpoints without agents |
+
+## Ansible (Path D)
+
+| File | Description |
+|------|-------------|
+| `ansible/deploy-velo.yml` | Deploy Velociraptor agents via Ansible to all targets |
+| `ansible/rollback-velo.yml` | Remove Velociraptor agents from all targets |
+| `ansible/inventory/hosts.yml` | Target machine inventory — edit on-site |
+| `ansible/group_vars/windows.yml` | WinRM connection settings (pre-configured) |
+| `ansible/roles/deploy_velo/` | Ansible role with deployment tasks and defaults |
 
 ## PDF Export
 
